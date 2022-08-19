@@ -596,3 +596,314 @@ class MySQLConnectionPool:
                     pass
 
             return cnt
+
+
+class MySQLConnectionPoolPlus:
+    """
+    Class defining a pool of MySQL connections,
+
+    Will not create `pool size` connections at initialization, but create `pool pre create num` connections,
+    when `pool pre create num` is less than `pool size`, otherwise create `pool size` connections.
+
+    Create pool size connections when optimizing initialization
+    """
+
+    def __init__(self, pool_size=10, pool_pre_create_num=2, pool_name=None, pool_reset_session=True, **kwargs):
+        """Initialize
+
+        Initialize a MySQL connection pool with a maximum number of
+        connections set to pool_size. The rest of the keywords
+        arguments, kwargs, are configuration arguments for MySQLConnection
+        instances.
+        """
+        self._pool_size = None
+        self._pool_name = None
+        self._pool_pre_create_num = None
+        self._current_pool_size = None
+        self._reset_session = pool_reset_session
+        self._set_pool_size(pool_size)
+        self._set_pool_pre_create_num(pool_pre_create_num)
+        self._set_pool_name(pool_name or generate_pool_name(**kwargs))
+        self._cnx_config = {}
+        self._cnx_queue = queue.Queue(self._pool_size)
+        self._config_version = uuid4()
+
+        if kwargs:
+            self.set_config(**kwargs)
+            cnt = 0
+            while cnt < self._pool_pre_create_num:
+                self._queue_connection(self.add_connection())
+                cnt += 1
+            self._current_pool_size = cnt
+
+    @property
+    def pool_name(self):
+        """Return the name of the connection pool"""
+        return self._pool_name
+
+    @property
+    def pool_size(self) -> int:
+        """Return number of connections managed by the pool"""
+        return self._pool_size
+
+    @property
+    def current_pool_size(self) -> int:
+        """Returns the number of connections in the current connection pool"""
+        return self._current_pool_size or 0
+
+    @property
+    def reset_session(self) -> bool:
+        """Return whether to reset session"""
+        return self._reset_session
+
+    @property
+    def get_connect(self) -> PooledMySQLConnection:
+        """Get a connection"""
+        return self.get_connection()
+
+    @property
+    def release_connect(self) -> bool:
+        """Release all connections"""
+        return self.remove_connections()
+
+    def set_config(self, **kwargs):
+        """Set the connection configuration for MySQLConnection instances
+
+        This method sets the configuration used for creating MySQLConnection
+        instances. See MySQLConnection for valid connection arguments.
+
+        Raises PoolError when a connection argument is not valid, missing
+        or not supported by MySQLConnection.
+        """
+        if not kwargs:
+            return
+
+        with CONNECTION_POOL_LOCK:
+            try:
+                test_cnx = connect()
+                test_cnx.config(**kwargs)
+                self._cnx_config = kwargs
+                self._config_version = uuid4()
+            except AttributeError as err:
+                raise PoolError(f"Connection configuration not valid: {err}") from err
+
+    def _set_pool_size(self, pool_size):
+        """Set the size of the pool
+
+        This method sets the size of the pool but it will not resize the pool.
+
+        Raises an AttributeError when the pool_size is not valid. Invalid size
+        is 0, negative or higher than pooling.CNX_POOL_MAXSIZE.
+        """
+        if pool_size <= 0 or pool_size > CNX_POOL_MAXSIZE:
+            raise AttributeError(
+                "Pool size should be higher than 0 and lower or equal to "
+                f"{CNX_POOL_MAXSIZE}"
+            )
+        self._pool_size = pool_size
+
+    def _set_pool_pre_create_num(self, pool_pre_create_num):
+        """Set the pre create connection size of the pool
+
+        This method sets the size of the pool but it will not resize the pool.
+
+        Raises an AttributeError when the pool_pre_create_num is not valid. Invalid size
+        is 0, negative or higher than pool_size.
+        """
+        if pool_pre_create_num <= 0 or pool_pre_create_num > self.pool_size:
+            raise AttributeError(
+                "Pool size should be higher than 0 and lower or equal to "
+                f"{CNX_POOL_MAXSIZE}"
+            )
+        self._pool_pre_create_num = pool_pre_create_num
+
+    def _set_pool_name(self, pool_name):
+        r"""Set the name of the pool.
+
+        This method checks the validity and sets the name of the pool.
+
+        Raises an AttributeError when pool_name contains illegal characters
+        ([^a-zA-Z0-9._\-*$#]) or is longer than pooling.CNX_POOL_MAXNAMESIZE.
+        """
+        if CNX_POOL_NAMEREGEX.search(pool_name):
+            raise AttributeError(f"Pool name '{pool_name}' contains illegal characters")
+        if len(pool_name) > CNX_POOL_MAXNAMESIZE:
+            raise AttributeError(f"Pool name '{pool_name}' is too long")
+        self._pool_name = pool_name
+
+    def _queue_connection(self, cnx):
+        """Put connection back in the queue
+
+        This method is putting a connection back in the queue. It will not
+        acquire a lock as the methods using _queue_connection() will have it
+        set.
+
+        Raises PoolError on errors.
+        """
+        if not isinstance(cnx, MYSQL_CNX_CLASS):
+            raise PoolError("Connection instance not subclass of MySQLConnection")
+
+        try:
+            self._cnx_queue.put(cnx, block=False)
+        except queue.Full as err:
+            raise PoolError("Failed adding connection; queue is full") from err
+
+    def add_connection(self, cnx=None):
+        """Create a connection and return
+
+        This method instantiates a MySQLConnection using the configuration
+        passed when initializing the MySQLConnectionPool instance or using
+        the set_config() method.
+        If cnx is a MySQLConnection instance, it will be added to the
+        queue.
+
+        Raises PoolError when no configuration is set, when no more
+        connection can be added (maximum reached) or when the connection
+        can not be instantiated.
+
+        Returns: MySQLConnection Object
+        """
+        with CONNECTION_POOL_LOCK:
+            if not self._cnx_config:
+                raise PoolError("Connection configuration not available")
+
+            if self._cnx_queue.full():
+                raise PoolError("Failed adding connection; queue is full")
+
+            if not cnx:
+                cnx = connect(**self._cnx_config)
+                try:
+                    if (
+                        self._reset_session
+                        and self._cnx_config["compress"]
+                        and cnx.get_server_version() < (5, 7, 3)
+                    ):
+                        raise NotSupportedError(
+                            "Pool reset session is not supported with "
+                            "compression for MySQL server version 5.7.2 "
+                            "or earlier"
+                        )
+                except KeyError:
+                    pass
+
+                cnx.pool_config_version = self._config_version
+            else:
+                if not isinstance(cnx, MYSQL_CNX_CLASS):
+                    raise PoolError(
+                        "Connection instance not subclass of MySQLConnection"
+                    )
+
+            return cnx
+
+    def get_connection(self):
+        """Get a connection from the pool
+
+        This method returns an PooledMySQLConnection instance which
+        has a reference to the pool that created it, and the next available
+        MySQL connection.
+
+        When the MySQL connection is not connect, a reconnect is attempted.
+
+        Raises PoolError on errors.
+
+        Returns a PooledMySQLConnection instance.
+        """
+        with CONNECTION_POOL_LOCK:
+            try:
+                cnx = self._cnx_queue.get(block=False)
+            except queue.Empty as err:
+                # If the number of currently created connections is less than the maximum number of connections,
+                # create a new connection
+                if self._current_pool_size < self._pool_size:
+                    cnx = self.add_connection()
+                    self._current_pool_size += 1
+                else:
+                    raise PoolError("Failed getting connection; pool exhausted") from err
+
+            if (
+                not cnx.is_connected()
+                or self._config_version != cnx.pool_config_version
+            ):
+                cnx.config(**self._cnx_config)
+                try:
+                    cnx.reconnect()
+                except InterfaceError:
+                    # Failed to reconnect, give connection back to pool
+                    self._queue_connection(cnx)
+                    raise
+                cnx.pool_config_version = self._config_version
+
+            return PooledMySQLConnection(self, cnx)
+
+    def _remove_connections(self):
+        """Close all connections
+
+        This method closes all connections. It returns the number
+        of connections it closed.
+
+        Used mostly for tests.
+
+        Returns int.
+        """
+        with CONNECTION_POOL_LOCK:
+            cnt = 0
+            cnxq = self._cnx_queue
+            while cnxq.qsize():
+                try:
+                    cnx = cnxq.get(block=False)
+                    cnx.disconnect()
+                    cnt += 1
+
+                    # Close a connection, decrement the number of currently created connections by one
+                    self._current_pool_size -= 1
+
+                except queue.Empty:
+                    return cnt
+                except PoolError:
+                    raise
+                except Error:
+                    # Any other error when closing means connection is closed
+                    pass
+
+            return cnt
+
+    def remove_connections(self, cnxobj=None) -> bool:
+        """Closes connection
+
+        This method closes connections objects.
+        If the parameter `cnx` is None, close all connections,
+        otherwise close the passed in connection object (cnx)
+
+        Returns int.
+        """
+        with CONNECTION_POOL_LOCK:
+            if cnxobj is None:
+                cnxq = self._cnx_queue
+                while cnxq.qsize():
+                    try:
+                        cnx = cnxq.get(block=False)
+                        cnx.disconnect()
+
+                        # Close a connection, decrement the number of currently created connections by one
+                        self._current_pool_size -= 1
+
+                    except queue.Empty:
+                        return True
+                    except PoolError:
+                        raise
+                    except Error:
+                        # Any other error when closing means connection is closed
+                        pass
+
+                return True
+            else:
+                try:
+                    cnxobj.disconnect()
+
+                    # Close a connection, decrement the number of currently created connections by one
+                    self._current_pool_size -= 1
+
+                    return True
+                except (PoolError, Error):
+                    # close connection exception
+                    return False
